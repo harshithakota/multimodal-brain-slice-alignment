@@ -1,0 +1,13 @@
+# requirements.txt
+
+# Core scientific stack
+numpy>=1.21
+scipy>=1.7
+scikit-image>=0.18
+scikit-learn>=1.0
+matplotlib>=3.4
+tqdm>=4.62
+opencv-python>=4.5
+
+# ANTsPy for registration
+antspyx>=0.3.8
