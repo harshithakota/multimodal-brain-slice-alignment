@@ -11,3 +11,6 @@ opencv-python>=4.5
 
 # ANTsPy for registration
 antspyx>=0.3.8
+
+# For annotations / polygons
+shapely>=2.0
