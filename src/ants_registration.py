@@ -10,6 +10,7 @@ from shapely import speedups
 from skimage.draw import polygon
 from tifffile import imwrite
 
+# Speed optimization for shapely polygons
 if speedups.available:
     speedups.enable()
 
@@ -49,7 +50,6 @@ print(f"✅ Found {len(paired_files)} pairs.")
 # Constants
 # ---------------------------
 DOWNSAMPLE_FACTOR = 128
-RESIZE_SHAPE = (256, 256)
 
 # ---------------------------
 # Process each pair
@@ -57,34 +57,32 @@ RESIZE_SHAPE = (256, 256)
 for idx, (he_file, maldi_file, anno_file) in enumerate(tqdm(paired_files, desc="Processing pairs")):
     # Load images
     he_img_orig = cv2.imread(os.path.join(he_dir, he_file), cv2.IMREAD_GRAYSCALE)
-    maldi_img_orig = cv2.imread(os.path.join(maldi_dir, maldi_file), cv2.IMREAD_GRAYSCALE)
+    maldi_img = cv2.imread(os.path.join(maldi_dir, maldi_file), cv2.IMREAD_GRAYSCALE)
 
-    # print(f"{he_file} original size: {he_img_orig.shape}, {maldi_file} size: {maldi_img_orig.shape}")
-
-    # Resize both to a common shape
-    he_img = cv2.resize(he_img_orig, RESIZE_SHAPE).astype(np.float32)
-    maldi_img = cv2.resize(maldi_img_orig, RESIZE_SHAPE).astype(np.float32)
+    # Resize H&E → match MALDI resolution (do NOT resize MALDI)
+    target_shape = (maldi_img.shape[1], maldi_img.shape[0])
+    he_img_resized = cv2.resize(he_img_orig, target_shape).astype(np.float32)
 
     # Normalize [0,1]
-    he_img = (he_img - he_img.min()) / (he_img.max() - he_img.min() + 1e-8)
+    he_img_resized = (he_img_resized - he_img_resized.min()) / (he_img_resized.max() - he_img_resized.min() + 1e-8)
     maldi_img = (maldi_img - maldi_img.min()) / (maldi_img.max() - maldi_img.min() + 1e-8)
 
     # Convert to ANTs format
     fixed = ants.from_numpy(maldi_img)   # MALDI → Fixed
-    moving = ants.from_numpy(he_img)     # H&E → Moving
+    moving = ants.from_numpy(he_img_resized)  # H&E → Moving
 
     # Nonlinear registration (SyN)
     reg = ants.registration(fixed=fixed, moving=moving, type_of_transform="SyN")
     warped = reg["warpedmovout"].numpy()
 
     # ---------------------------
-    # Generate binary mask from GeoJSON annotations
+    # Generate binary mask from GeoJSON
     # ---------------------------
     anno_path = os.path.join(anno_dir, anno_file)
     with open(anno_path, "r") as f:
         anno_data = json.load(f)
 
-    mask = np.zeros(RESIZE_SHAPE, dtype=np.uint8)
+    mask = np.zeros_like(maldi_img, dtype=np.uint8)
 
     for feat in anno_data["features"]:
         geom = shape(feat["geometry"])
@@ -98,15 +96,15 @@ for idx, (he_file, maldi_file, anno_file) in enumerate(tqdm(paired_files, desc="
         for poly in polygons:
             coords = np.array(poly.exterior.coords)
 
-            # Scale from full-resolution coordinates to low-res resized coordinates
-            coords[:, 0] = (coords[:, 0] / DOWNSAMPLE_FACTOR) * (RESIZE_SHAPE[0] / he_img_orig.shape[1])
-            coords[:, 1] = (coords[:, 1] / DOWNSAMPLE_FACTOR) * (RESIZE_SHAPE[1] / he_img_orig.shape[0])
+            # Scale from full-resolution coordinates → MALDI resolution
+            coords[:, 0] = coords[:, 0] / DOWNSAMPLE_FACTOR * (maldi_img.shape[1] / he_img_orig.shape[1])
+            coords[:, 1] = coords[:, 1] / DOWNSAMPLE_FACTOR * (maldi_img.shape[0] / he_img_orig.shape[0])
 
             rr, cc = polygon(coords[:, 1], coords[:, 0], mask.shape)
             mask[rr, cc] = 1
 
     # ---------------------------
-    # Warp the mask using registration transform
+    # Warp mask using registration transform
     # ---------------------------
     mask_ants = ants.from_numpy(mask.astype(np.float32))
     warped_mask = ants.apply_transforms(
@@ -117,72 +115,33 @@ for idx, (he_file, maldi_file, anno_file) in enumerate(tqdm(paired_files, desc="
     ).numpy()
 
     # ---------------------------
-    # Prepare overlays
+    # Visualization (6 panels)
     # ---------------------------
     warped_norm = (warped - warped.min()) / (warped.max() - warped.min() + 1e-8)
-    maldi_norm = (maldi_img - maldi_img.min()) / (maldi_img.max() - maldi_img.min() + 1e-8)
+    overlay_on_he = np.dstack([warped_norm, warped_norm * 0.5 + warped_mask * 0.5, warped_norm * 0.5])
+    overlay_on_maldi = np.dstack([maldi_img, maldi_img * 0.5 + warped_mask * 0.5, maldi_img * 0.5])
+    aligned_overlay = np.dstack([warped_norm, maldi_img, np.zeros_like(warped_norm)])  # red-green composite
 
-    # Overlay mask on warped H&E
-    overlay_on_he = np.dstack([
-        warped_norm, 
-        warped_norm * 0.5 + warped_mask * 0.5,
-        warped_norm * 0.5
-    ])
+    plt.figure(figsize=(28, 4))
+    titles = [
+        "MALDI (Fixed)", "H&E (Moving → Resized)", "Warped H&E",
+        "Binary Mask", "Mask on Warped H&E", "Mask on MALDI (Fixed)"
+    ]
+    images = [maldi_img, he_img_resized, warped_norm, mask, overlay_on_he, overlay_on_maldi]
 
-    # Overlay mask on MALDI
-    overlay_on_maldi = np.dstack([
-        maldi_norm,
-        maldi_norm * 0.5 + warped_mask * 0.5,
-        maldi_norm * 0.5
-    ])
-
-    # Aligned overlay (H&E vs MALDI)
-    aligned_overlay = np.dstack([
-        warped_norm, 
-        maldi_norm, 
-        np.zeros_like(warped_norm)
-    ])
-
-    # ---------------------------
-    # Visualization
-    # ---------------------------
-    plt.figure(figsize=(24, 4))
-    plt.subplot(1, 6, 1)
-    plt.imshow(maldi_norm, cmap="Greens")
-    plt.title("MALDI (Fixed)")
-    plt.axis("off")
-
-    plt.subplot(1, 6, 2)
-    plt.imshow(he_img, cmap="Reds")
-    plt.title("H&E (Moving)")
-    plt.axis("off")
-
-    plt.subplot(1, 6, 3)
-    plt.imshow(warped_norm, cmap="gray")
-    plt.title("Warped H&E")
-    plt.axis("off")
-
-    plt.subplot(1, 6, 4)
-    plt.imshow(mask, cmap="gray")
-    plt.title("Binary Mask")
-    plt.axis("off")
-
-    plt.subplot(1, 6, 5)
-    plt.imshow(overlay_on_he)
-    plt.title("Mask on Warped H&E")
-    plt.axis("off")
-
-    plt.subplot(1, 6, 6)
-    plt.imshow(overlay_on_maldi)
-    plt.title("Mask on MALDI (Fixed)")
-    plt.axis("off")
+    for i, (img, title) in enumerate(zip(images, titles), start=1):
+        plt.subplot(1, 6, i)
+        plt.imshow(img, cmap="gray" if img.ndim == 2 else None)
+        plt.title(title)
+        plt.axis("off")
 
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir_images, f"alignment_{idx}.png"), bbox_inches="tight")
     plt.close()
 
-    # Save binary warped mask (both .npy and .tif)
-    # np.save(os.path.join(output_dir_masks, f"mask_{idx}.npy"), warped_mask)
+    # ---------------------------
+    # Save binary warped mask
+    # ---------------------------
     imwrite(os.path.join(output_dir_masks, f"mask_{idx}.tif"), (warped_mask * 255).astype(np.uint8))
 
-print(f"Done! Results saved in {output_dir_images} and {output_dir_masks}")
+print(f"✅ Done! Results saved in {output_dir_images} and {output_dir_masks}")
