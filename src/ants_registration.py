@@ -37,14 +37,15 @@ anno_files = sorted([f for f in os.listdir(anno_dir) if f.endswith(".geojson")])
 paired_files = []
 for he_file in he_files:
     prefix = he_file.split("_")[0]  # e.g., A1, B22
-    match = next((m for m in maldi_files if m.startswith(prefix)), None)
-    anno_match = next((a for a in anno_files if a.startswith(prefix)), None)
+    match = next((m for m in maldi_files if m.split("_")[0] == prefix), None)
+    anno_match = next((a for a in anno_files if a.split("_")[0] == prefix), None)
+
     if match and anno_match:
         paired_files.append((he_file, match, anno_match))
     else:
         print(f"⚠️ Missing match for prefix {prefix}")
 
-print(f"✅ Found {len(paired_files)} pairs.")
+print(f"✅ Found {len(paired_files)} valid triplets (H&E + MALDI + annotation)")
 
 # ---------------------------
 # Constants
@@ -59,6 +60,10 @@ for idx, (he_file, maldi_file, anno_file) in enumerate(tqdm(paired_files, desc="
     he_img_orig = cv2.imread(os.path.join(he_dir, he_file), cv2.IMREAD_GRAYSCALE)
     maldi_img = cv2.imread(os.path.join(maldi_dir, maldi_file), cv2.IMREAD_GRAYSCALE)
 
+    if he_img_orig is None or maldi_img is None:
+        print(f"⚠️ Skipping due to missing image for prefix {he_file}")
+        continue
+
     # Resize H&E → match MALDI resolution (do NOT resize MALDI)
     target_shape = (maldi_img.shape[1], maldi_img.shape[0])
     he_img_resized = cv2.resize(he_img_orig, target_shape).astype(np.float32)
@@ -68,8 +73,8 @@ for idx, (he_file, maldi_file, anno_file) in enumerate(tqdm(paired_files, desc="
     maldi_img = (maldi_img - maldi_img.min()) / (maldi_img.max() - maldi_img.min() + 1e-8)
 
     # Convert to ANTs format
-    fixed = ants.from_numpy(maldi_img)   # MALDI → Fixed
-    moving = ants.from_numpy(he_img_resized)  # H&E → Moving
+    fixed = ants.from_numpy(maldi_img)   # MALDI = Fixed
+    moving = ants.from_numpy(he_img_resized)  # H&E = Moving
 
     # Nonlinear registration (SyN)
     reg = ants.registration(fixed=fixed, moving=moving, type_of_transform="SyN")
@@ -79,12 +84,20 @@ for idx, (he_file, maldi_file, anno_file) in enumerate(tqdm(paired_files, desc="
     # Generate binary mask from GeoJSON
     # ---------------------------
     anno_path = os.path.join(anno_dir, anno_file)
-    with open(anno_path, "r") as f:
-        anno_data = json.load(f)
+    if not os.path.exists(anno_path) or os.path.getsize(anno_path) == 0:
+        print(f"⚠️ Skipping empty or missing annotation file: {anno_file}")
+        continue
+
+    try:
+        with open(anno_path, "r") as f:
+            anno_data = json.load(f)
+    except json.JSONDecodeError:
+        print(f"⚠️ Invalid JSON in {anno_file}, skipping.")
+        continue
 
     mask = np.zeros_like(maldi_img, dtype=np.uint8)
 
-    for feat in anno_data["features"]:
+    for feat in anno_data.get("features", []):
         geom = shape(feat["geometry"])
         if geom.geom_type == "Polygon":
             polygons = [geom]
@@ -120,11 +133,10 @@ for idx, (he_file, maldi_file, anno_file) in enumerate(tqdm(paired_files, desc="
     warped_norm = (warped - warped.min()) / (warped.max() - warped.min() + 1e-8)
     overlay_on_he = np.dstack([warped_norm, warped_norm * 0.5 + warped_mask * 0.5, warped_norm * 0.5])
     overlay_on_maldi = np.dstack([maldi_img, maldi_img * 0.5 + warped_mask * 0.5, maldi_img * 0.5])
-    aligned_overlay = np.dstack([warped_norm, maldi_img, np.zeros_like(warped_norm)])  # red-green composite
 
     plt.figure(figsize=(28, 4))
     titles = [
-        "MALDI (Fixed)", "H&E (Moving → Resized)", "Warped H&E",
+        "MALDI (Fixed)", "H&E (Resized)", "Warped H&E",
         "Binary Mask", "Mask on Warped H&E", "Mask on MALDI (Fixed)"
     ]
     images = [maldi_img, he_img_resized, warped_norm, mask, overlay_on_he, overlay_on_maldi]
